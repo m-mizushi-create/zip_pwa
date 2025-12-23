@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>住所→郵便番号 v3</title>
+
+  <link rel="manifest" href="./manifest.webmanifest">
+  <meta name="theme-color" content="#2ea3ff">
+
+  <style>
+    body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;margin:0;background:#f6f7f9}
+    .wrap{max-width:980px;margin:40px auto;padding:0 20px}
+    label{display:block;font-weight:700;margin:0 0 8px}
+    textarea{width:100%;height:110px;font-size:18px;padding:14px;border:2px solid #c9ccd3;border-radius:10px;box-sizing:border-box}
+    .row{display:flex;gap:14px;align-items:center;margin:18px 0}
+    button{border:0;border-radius:10px;padding:12px 18px;font-size:18px;cursor:pointer}
+    .btn-blue{background:#2ea3ff;color:#fff;font-weight:700}
+    .btn-gray{background:#b9bcc3;color:#111;min-width:110px}
+    .out{display:flex;gap:10px;align-items:center}
+    input{flex:1;font-size:20px;padding:12px 14px;border:2px solid #c9ccd3;border-radius:10px}
+
+    .status{color:#666;min-height:1.2em}
+    .hint{color:#666;font-size:14px;margin-top:8px}
+
+    /* 候補エリア */
+    .cands{margin-top:18px;background:#fff;border:2px solid #e3e5ea;border-radius:12px;padding:14px;display:none}
+    .cands-head{display:flex;gap:10px;align-items:center;justify-content:space-between;margin-bottom:10px}
+    .cands-head strong{font-size:16px}
+    .filter{display:flex;gap:10px;align-items:center}
+    .filter input{font-size:16px;padding:10px 12px;border:2px solid #c9ccd3;border-radius:10px}
+    .list{max-height:320px;overflow:auto;border-top:1px solid #eee;margin-top:10px}
+    .item{display:flex;gap:12px;align-items:center;justify-content:space-between;padding:10px 6px;border-bottom:1px solid #f0f1f4;cursor:pointer}
+    .item:hover{background:#f7fbff}
+    .town{font-weight:600}
+    .zip{font-family:ui-monospace, SFMono-Regular, Menlo, monospace}
+    .badge{font-size:12px;color:#555;background:#eef0f4;border-radius:999px;padding:3px 8px;margin-left:8px}
+
+    /* 都道府県候補 */
+    .prefpick{margin-top:12px;display:none}
+    .prefpick .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}
+    .chip{background:#eef0f4;border-radius:999px;padding:8px 12px;cursor:pointer}
+    .chip:hover{background:#e6ebf5}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <label>住所を入力：</label>
+    <div style="position:relative">
+      <textarea id="addr" placeholder="例）須坂市塩川町631-5 / 須坂市塩川町 / 須坂市"></textarea>
+      <button id="clear" class="btn-gray" style="position:absolute;right:10px;top:10px">Clear</button>
+    </div>
+
+    <div class="row">
+      <button id="search" class="btn-blue">▼ 検索する</button>
+      <div id="status" class="status"></div>
+    </div>
+
+    <label>郵便番号：</label>
+    <div class="out">
+      <span style="font-size:20px;font-weight:700">〒</span>
+      <input id="zip" readonly />
+      <button id="copy" class="btn-gray">Copy</button>
+    </div>
+
+    <div id="prefpick" class="prefpick">
+      <div><strong>都道府県が特定できません：</strong> 市区町村名が複数県に存在します。選んでください。</div>
+      <div id="prefChips" class="chips"></div>
+    </div>
+
+    <div id="cands" class="cands">
+      <div class="cands-head">
+        <div>
+          <strong id="candsTitle">候補</strong>
+          <span id="candsCount" class="badge"></span>
+        </div>
+        <div class="filter">
+          <span style="color:#666;font-size:14px">絞り込み（町域）</span>
+          <input id="filter" placeholder="例：塩川" />
+        </div>
+      </div>
+      <div id="list" class="list"></div>
+    </div>
+
+    <div class="hint">
+      ・一意なら即表示。複数なら候補をクリックで確定（クリック時に自動コピーも可能）<br/>
+      ・市区町村だけでも候補一覧が出ます（多い場合は絞り込みが便利）
+    </div>
+  </div>
+
+<script>
+
+  // ====== PWA: Service Worker 登録（あってもなくてもOK） ======
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("./service-worker.js").catch(()=>{});
+  }
+
+  // ====== 辞書 ======
+  let BUNDLE = null;
+
+  async function loadBundle(){
+    if (BUNDLE) return BUNDLE;
+    setStatus("辞書読込中…");
+    const res = await fetch("./index_bundle.json", {cache:"no-cache"});
+    BUNDLE = await res.json();
+    setStatus("");
+    return BUNDLE;
+  }
+
+  // ====== DOM helper ======
+  const $ = (id)=>document.getElementById(id);
+
+  function setStatus(msg){ $("status").textContent = msg || ""; }
+
+  function escapeHtml(s){
+    return String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+  }
+
+  function showCandidates(title, arr){
+    $("candsTitle").textContent = title;
+    $("candsCount").textContent = `${arr.length}件`;
+    $("cands").style.display = "block";
+    $("list").innerHTML = "";
+
+    for (const it of arr){
+      const div = document.createElement("div");
+      div.className = "item";
+      div.dataset.zip = it.zip;
+      div.innerHTML = `
+        <div class="town">${escapeHtml(it.label || it.town || "")}</div>
+        <div class="zip">${escapeHtml(it.zip)}</div>
+      `;
+      div.onclick = async ()=>{
+        $("zip").value = it.zip;
+        setStatus("候補を確定しました");
+        await copyZip(); // クリックで自動コピー（不要なら削除OK）
+      };
+      $("list").appendChild(div);
+    }
+  }
+
+  function hideCandidates(){
+    $("cands").style.display = "none";
+    $("list").innerHTML = "";
+    $("filter").value = "";
+  }
+
+  function showPrefPick(cityName, cityKeys){
+    $("prefpick").style.display = "block";
+    $("prefChips").innerHTML = "";
+    for (const key of cityKeys){
+      const chip = document.createElement("div");
+      chip.className = "chip";
+      chip.textContent = key;
+      chip.onclick = ()=>{
+        $("prefpick").style.display = "none";
+        handleCityKey(key, ""); // 県市を選んだら町域候補を出す
+      };
+      $("prefChips").appendChild(chip);
+    }
+    setStatus(`「${cityName}」は複数候補あり`);
+  }
+
+  function hidePrefPick(){
+    $("prefpick").style.display = "none";
+    $("prefChips").innerHTML = "";
+  }
+
+  // ====== 住所正規化 ======
+  function normalizeRaw(s){
+    if(!s) return "";
+    return s
+      .replace(/\s+/g,"")
+      .replace(/[‐-‒–—―ー−]/g,"-")
+      .replace(/（.*?）/g,"")
+      .replace(/丁目/g,"-")
+      .trim();
+  }
+
+  function stripAfterNumbers(s){
+    return s.replace(/[0-9０-９].*$/,"");
+  }
+
+  function looksLikeHasPref(s){
+    return /(都|道|府|県)/.test(s);
+  }
+
+  function extractCityName(input){
+    // 例: 長野市篠ノ井会 -> 長野市
+    // 例: ○○郡△△町 -> ○○郡△△町
+    const m = input.match(/^(.+?(?:郡.+?)?[市区町村])/);
+    return m ? m[1] : null;
+  }
+
+  function getTownHint(fullNormalized, cityName){
+    let rest = fullNormalized;
+    if (cityName && rest.startsWith(cityName)){
+      rest = rest.slice(cityName.length);
+    }
+    rest = rest.replace(/^大字/, "").replace(/^字/, "");
+    rest = stripAfterNumbers(rest);
+    return rest.trim();
+  }
+
+  // ====== 最長一致（完全一致キーを短くして探す） ======
+  function longestMatchTownIndex(townIndex, key){
+    for (let cut = key.length; cut >= 2; cut--){
+      const k = key.slice(0, cut);
+      if (townIndex[k]) return {matchedKey:k, zips:townIndex[k]};
+    }
+    return null;
+  }
+
+  // ====== Copy ======
+  async function copyZip(){
+    const v = $("zip").value;
+    if(!v){ setStatus("郵便番号が空です"); return; }
+    await navigator.clipboard.writeText(v);
+    setStatus("コピーしました");
+    setTimeout(()=>{ if($("status").textContent==="コピーしました") setStatus(""); }, 800);
+  }
+
+  // ====== 市区町村候補表示（町域フィルタ付き） ======
+  async function handleCityKey(cityKey, initialFilter=""){
+    const {cityIndex} = BUNDLE;
+
+    hideCandidates();
+    $("zip").value = "";
+
+    const arr = cityIndex[cityKey];
+    if (!arr || !arr.length){
+      setStatus("市区町村が辞書に見つかりませんでした");
+      return;
+    }
+
+    const candidates = arr.map(x => ({
+      town: x.town || "",
+      label: `${cityKey}${x.town || ""}`,
+      zip: (x.zips && x.zips[0]) ? x.zips[0] : ""
+    })).filter(x => x.zip);
+
+    showCandidates(`${cityKey} の町域候補`, candidates);
+    setStatus("候補から選んでください（絞り込み可）");
+
+    // ===== 絞り込み（件数更新 & 1件なら自動確定） =====
+    $("filter").oninput = null;
+
+    function applyFilter(){
+      const q = $("filter").value.trim();
+      const items = $("list").querySelectorAll(".item");
+      let visible = 0;
+      let lastVisible = null;
+
+      for (const el of items){
+        const town = el.querySelector(".town")?.textContent || "";
+        const ok = (!q || town.includes(q));
+        el.style.display = ok ? "" : "none";
+        if (ok){
+          visible++;
+          lastVisible = el;
+        }
+      }
+
+      $("candsCount").textContent = `${visible}件`;
+
+      // 町域ヒントがあって1件なら自動確定
+      if (q && visible === 1 && lastVisible){
+        lastVisible.click();
+      }
+
+      console.log("filter=", q, "total=", items.length, "visible=", visible);
+    }
+
+    $("filter").oninput = applyFilter;
+
+    $("filter").value = initialFilter || "";
+    applyFilter();
+  }
+
+  // ====== 検索 ======
+  async function doSearch(){
+    await loadBundle();
+    hideCandidates();
+    hidePrefPick();
+    setStatus("");
+
+    const raw = $("addr").value;
+    const n0 = normalizeRaw(raw);
+    if(!n0){
+      setStatus("住所を入力してください");
+      return;
+    }
+    const n = stripAfterNumbers(n0);
+
+    const {townIndex, cityNameIndex} = BUNDLE;
+
+    // 1) 都道府県あり：townIndex 最長一致 → ダメなら市区町村候補
+    if (looksLikeHasPref(n)){
+      const r = longestMatchTownIndex(townIndex, n);
+      if (r){
+        const zips = r.zips;
+        if (zips.length === 1){
+          $("zip").value = zips[0];
+          setStatus(`一致: ${r.matchedKey}`);
+          return;
+        } else {
+          const candidates = zips.map(z => ({ town:r.matchedKey, label:r.matchedKey, zip:z }));
+          showCandidates(`候補（${r.matchedKey}）`, candidates);
+          setStatus("候補が複数あります。クリックで確定");
+          return;
+        }
+      }
+
+      const cityMatch = n.match(/^(.+?[都道府県].+?(?:郡.+?)?[市区町村])/);
+      if (cityMatch){
+        const cityKey = cityMatch[1];
+        if (BUNDLE.cityIndex[cityKey]){
+          await handleCityKey(cityKey, "");
+          return;
+        }
+      }
+
+      setStatus("見つかりませんでした（表記ゆれ/辞書未対応の可能性）");
+      return;
+    }
+
+    // 2) 都道府県なし：市区町村抽出 → 県候補 → townIndex狙い撃ち → 候補一覧（初期フィルタ）
+    const cityName = extractCityName(n);
+    if (!cityName){
+      setStatus("市区町村名が判別できませんでした（例：須坂市 などを含めてください）");
+      return;
+    }
+
+    const townHint = getTownHint(n, cityName);
+    const cityKeys = cityNameIndex[cityName];
+
+    if (!cityKeys || !cityKeys.length){
+      setStatus("市区町村が辞書に見つかりませんでした（表記をご確認ください）");
+      return;
+    }
+
+    if (cityKeys.length === 1){
+      const cityKey = cityKeys[0];
+
+      // 町域ヒントがあるなら townIndex を先に狙う
+      if (townHint){
+        const tryKey = cityKey + townHint;
+        const r = longestMatchTownIndex(townIndex, tryKey);
+        if (r){
+          const zips = r.zips;
+          if (zips.length === 1){
+            $("zip").value = zips[0];
+            setStatus(`一致: ${r.matchedKey}`);
+            return;
+          } else {
+            const candidates = zips.map(z => ({ town:r.matchedKey, label:r.matchedKey, zip:z }));
+            showCandidates(`候補（${r.matchedKey}）`, candidates);
+            setStatus("候補が複数あります。クリックで確定");
+            return;
+          }
+        }
+      }
+
+      // townIndexで決まらなくても、初期フィルタを入れて候補一覧
+      await handleCityKey(cityKey, townHint);
+      return;
+    }
+
+    // 同名市区町村が複数県に存在
+    showPrefPick(cityName, cityKeys);
+  }
+
+  // ====== events ======
+  $("clear").onclick = ()=>{
+    $("addr").value = "";
+    $("zip").value = "";
+    setStatus("");
+    hideCandidates();
+    hidePrefPick();
+  };
+
+  $("search").onclick = doSearch;
+
+  $("copy").onclick = copyZip;
+
+  $("addr").addEventListener("keydown", (e)=>{
+    if((e.ctrlKey || e.metaKey) && e.key === "Enter"){
+      doSearch();
+    }
+  });
+
+</script>
+</body>
+</html>
+
